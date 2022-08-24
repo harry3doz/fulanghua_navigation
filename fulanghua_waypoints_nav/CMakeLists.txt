@@ -11,6 +11,8 @@ find_package(catkin REQUIRED COMPONENTS
   tf
   std_srvs
   fulanghua_srvs
+  orne_waypoints_msgs
+  fulanghua_action
 )
 
 find_package(PkgConfig)
@@ -24,6 +26,7 @@ catkin_package(
   #INCLUDE_DIRS include
   LIBRARIES ${PROJECT_NAME}
 )
+
 
 include_directories(
   #include 
@@ -43,5 +46,18 @@ target_link_libraries(waypoints_saver
 target_link_libraries(waypoints_nav
     ${catkin_LIBRARIES}
     ${yaml-cpp_LIBRARIES}
+)
+
+
+install(TARGETS waypoints_nav waypoints_saver
+  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(DIRECTORY
+   launch
+   src
+   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 

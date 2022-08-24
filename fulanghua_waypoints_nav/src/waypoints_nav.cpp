@@ -34,13 +34,17 @@
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Twist.h>
+#include "orne_waypoints_msgs/Waypoint.h"
+#include "orne_waypoints_msgs/WaypointArray.h"
+#include "std_msgs/Bool.h"
 #include <move_base_msgs/MoveBaseAction.h>
 #include <actionlib/client/simple_action_client.h>
 #include <tf/tf.h>
 #include <tf/transform_listener.h>
 #include <visualization_msgs/MarkerArray.h>
-#include <fulanghua_srvs/Pose.h>
-
+#include <fulanghua_srvs/_Pose.h>
+#include <fulanghua_srvs/actions.h>
+#include <fulanghua_action/special_moveAction.h>
 #include <yaml-cpp/yaml.h>
 
 #include <vector>
@@ -68,9 +72,11 @@ public:
     WaypointsNavigation() :
         has_activate_(false),
         move_base_action_("move_base", true),
+        action_client("action", true),
         rate_(10),
         last_moved_time_(0),
-        dist_err_(0.8)
+        dist_err_(0.8),
+        amcl_filename_("")
     {
         while((move_base_action_.waitForServer(ros::Duration(1.0)) == false) && (ros::ok() == true))
         {
@@ -79,8 +85,11 @@ public:
         
         ros::NodeHandle private_nh("~");
         private_nh.param("robot_frame", robot_frame_, std::string("base_link"));
+        private_nh.param("robot_naame", robot_name_, std::string("go1"));
         private_nh.param("world_frame", world_frame_, std::string("map"));
-        
+        private_nh.param("cmd_vel", cmd_vel_, std::string("cmd_vel"));
+        private_nh.param("charge_topic", CHARGE_TOPIC, std::string("charge"));
+        private_nh.param("amcl_filename", amcl_filename_,amcl_filename_);
         double max_update_rate;
         private_nh.param("max_update_rate", max_update_rate, 10.0);
         rate_ = ros::Rate(max_update_rate);
@@ -91,6 +100,10 @@ public:
             if(!readFile(filename)) {
                 ROS_ERROR("Failed loading waypoints file");
             } else {
+                first_waypoint_ =  waypoints_.poses.begin();
+                while(first_waypoint_->position.action=="charge"){
+                    first_waypoint_++;
+                }
                 last_waypoint_ = waypoints_.poses.end()-2;
                 finish_pose_ = waypoints_.poses.end()-1;
                 computeWpOrientation();
@@ -106,13 +119,81 @@ public:
         start_server_ = nh.advertiseService("start_wp_nav", &WaypointsNavigation::startNavigationCallback, this);
         pause_server_ = nh.advertiseService("pause_wp_nav", &WaypointsNavigation::pauseNavigationCallback,this);
         unpause_server_ = nh.advertiseService("unpause_wp_nav", &WaypointsNavigation::unpauseNavigationCallback,this);
-        stop_server_ = nh.advertiseService("stop_wp_nav", &WaypointsNavigation::pauseNavigationCallback,this);
+        stop_server_ = nh.advertiseService("stop_wp_nav", &WaypointsNavigation::stopNavigationCallback,this);
         suspend_server_ = nh.advertiseService("suspend_wp_pose", &WaypointsNavigation::suspendPoseCallback, this);
         resume_server_ = nh.advertiseService("resume_wp_pose", &WaypointsNavigation::resumePoseCallback, this);
         search_server_ = nh.advertiseService("near_wp_nav",&WaypointsNavigation::searchPoseCallback, this);
-        cmd_vel_sub_ = nh.subscribe("icart_mini/cmd_vel", 1, &WaypointsNavigation::cmdVelCallback, this);
-        wp_pub_ = nh.advertise<geometry_msgs::PoseArray>("waypoints", 10);
+        cmd_vel_sub_ = nh.subscribe(cmd_vel_, 1, &WaypointsNavigation::cmdVelCallback, this);
+        cmd_vel_pub_ = nh.advertise<geometry_msgs::Twist>(cmd_vel_,1000);
+        robot_coordinate_pub = nh.advertise<geometry_msgs::Point>("robot_coordinate",1000);
+        // action_exe_sub = nh.subscribe("cmd_vel_executing", 1000, &WaypointsNavigation::actionExeCallback, this);
+        charge_sub = nh.subscribe(CHARGE_TOPIC, 1000, &WaypointsNavigation::needChargeCallback, this);
+        wp_pub_ = nh.advertise<orne_waypoints_msgs::WaypointArray>("waypoints", 10);
         clear_costmaps_srv_ = nh.serviceClient<std_srvs::Empty>("/move_base/clear_costmaps");
+        action_cmd_srv = nh.serviceClient<fulanghua_srvs::actions>("/action/start");
+        //added below
+        loop_start_server = nh.advertiseService("loop_start_wp_nav", &WaypointsNavigation::loopStartCallback, this);
+        loop_stop_server = nh.advertiseService("loop_stop_wp_nav", &WaypointsNavigation::loopStopCallback, this);
+        roundtrip_on_server_ = nh.advertiseService("roundtrip_on_nav", &WaypointsNavigation::roundTripOnCallback, this);
+        roundtrip_off_server_ = nh.advertiseService("roundtrip_off_nav", &WaypointsNavigation::roundTripOffCallback, this);
+        command_server = nh.advertiseService("finish_action", &WaypointsNavigation::action_service_stop_callback, this);
+    }
+
+    
+    bool roundTripOnCallback(std_srvs::Empty::Request& req, std_srvs::Empty::Response& res){
+        ROS_INFO("roundtrip is on");
+        REVERSE = true;
+    }
+
+    bool roundTripOffCallback(std_srvs::Empty::Request& req, std_srvs::Empty::Response& res){
+        ROS_INFO("roundtrip is off");
+        REVERSE = false;
+    }
+
+
+    bool loopStartCallback(std_srvs::Empty::Request& req, std_srvs::Empty::Response& res){
+        ROS_INFO("loop is on");
+        LOOP = true;
+    }
+
+    bool loopStopCallback(std_srvs::Empty::Request& req, std_srvs::Empty::Response& res){
+        ROS_INFO("loop is off");
+        LOOP = false;
+    }
+
+    const std::vector<orne_waypoints_msgs::Pose>::iterator makeQueue(const std::string& command){
+        
+        orne_waypoints_msgs::WaypointArray dummy_array;
+        orne_waypoints_msgs::Pose pose;
+        pose.position.action = "speak";
+        pose.position.file = command;
+        pose.position.duration = INT_MAX;
+        pose.position.x =0;
+        pose.position.y =0;
+        pose.position.z =0;
+        pose.orientation.x =0;
+        pose.orientation.y =0;
+        pose.orientation.z =0;
+        pose.orientation.w =0;
+        ROS_WARN("Made it");
+        dummy_array.poses.push_back(pose);
+        return dummy_array.poses.begin();
+    }
+
+    std::vector<orne_waypoints_msgs::Pose>::iterator makeQueue(const std::string& command1, const std::string& command2){
+        std::vector<orne_waypoints_msgs::Pose>::iterator dummy;
+        orne_waypoints_msgs::Pose pose;
+        pose.position.action = command1;
+        pose.position.file = command2;
+        pose.position.duration = INT_MAX;
+        pose.position.x =0;
+        pose.position.y =0;
+        pose.position.z =0;
+        pose.orientation.x =0;
+        pose.orientation.y =0;
+        pose.orientation.z =0;
+        pose.orientation.w =0;
+        return dummy;
     }
 
     bool startNavigationCallback(std_srvs::Trigger::Request &request, std_srvs::Trigger::Response &response) {
@@ -120,7 +201,30 @@ public:
             response.success = false;
             return false;
         }
-        
+        ros::NodeHandle private_nh("~");
+        private_nh.param("robot_frame", robot_frame_, std::string("base_link"));
+        private_nh.param("world_frame", world_frame_, std::string("map"));
+        private_nh.param("cmd_vel", cmd_vel_, std::string("cmd_vel"));
+        std::string filename = "";
+        private_nh.param("filename", filename, filename);
+        if(filename != ""){
+            ROS_INFO_STREAM("Read waypoints data from " << filename);
+            if(!readFile(filename)) {
+                ROS_ERROR("Failed loading waypoints file");
+            } else {
+                first_waypoint_ = waypoints_.poses.begin();
+                while(first_waypoint_->position.action=="charge"){
+                    first_waypoint_++;
+                }
+                last_waypoint_ = waypoints_.poses.end()-2;
+                finish_pose_ = waypoints_.poses.end()-1;
+                computeWpOrientation();
+            }
+            current_waypoint_ = waypoints_.poses.begin();
+        } else {
+            ROS_ERROR("waypoints file doesn't have name");
+        }
+
         std_srvs::Empty empty;
         while(!clear_costmaps_srv_.call(empty)) {
             ROS_WARN("Resend clear costmap service");
@@ -128,20 +232,21 @@ public:
         }
 
         current_waypoint_ = waypoints_.poses.begin();
+        ROS_WARN("Start!");
+        std::string rname = "guide_" + robot_name_;
+        actionServiceCall(makeQueue(rname));
         has_activate_ = true;
         response.success = true;
         return true;
     }
 
-    bool pauseNavigationCallback(std_srvs::Trigger::Request &request, std_srvs::Trigger::Response &response){
+    bool pauseNavigationCallback(std_srvs::Empty::Request &request, std_srvs::Empty::Response &response){
          if(!has_activate_) {
             ROS_WARN("Navigation is already pause");
-            response.success = false;
             return false;
         }
-        
+        ROS_WARN("Navigation has been paused");
         has_activate_ = false;
-        response.success = true;
         return true;
     }
 
@@ -156,38 +261,39 @@ public:
         return true;
     }
 
-    void stopNavigationCallback(std_srvs::Empty::Request &request, std_srvs::Empty::Response &response){
+    bool stopNavigationCallback(std_srvs::Empty::Request &request, std_srvs::Empty::Response &response){
+        ROS_WARN("Navigation has been stopped");
         has_activate_ = false;
         move_base_action_.cancelAllGoals();
+        return true;
     }
 
-    bool resumePoseCallback(fulanghua_srvs::Pose::Request &request, fulanghua_srvs::Pose::Response &response) {
+    bool resumePoseCallback(std_srvs::Empty::Request &request, std_srvs::Empty::Request &response) {
         if(has_activate_) {
-            response.status = false;
             return false;
         }
-        
+        tf::StampedTransform robot_gl = getRobotPosGL();
         std_srvs::Empty empty;
         clear_costmaps_srv_.call(empty);
         //move_base_action_.cancelAllGoals();
         
         ///< @todo calculating metric with request orientation
         double min_dist = std::numeric_limits<double>::max();
-        for(std::vector<geometry_msgs::Pose>::iterator it = current_waypoint_; it != finish_pose_; it++) {
-            double dist = hypot(it->position.x - request.pose.position.x, it->position.y - request.pose.position.y);
+        for(std::vector<orne_waypoints_msgs::Pose>::iterator it = current_waypoint_; it != finish_pose_; it++) {
+            double dist = hypot(it->position.x -robot_gl.getOrigin().x(), it->position.y - robot_gl.getOrigin().y());
             if(dist < min_dist) {
                 min_dist = dist;
                 current_waypoint_ = it;
+                ROS_WARN("Navigation has been resumed");
             }
         }
         
-        response.status = true;
         has_activate_ = true;
 
         return true;
     }
 
-    bool suspendPoseCallback(fulanghua_srvs::Pose::Request &request, fulanghua_srvs::Pose::Response &response) {
+    bool suspendPoseCallback(fulanghua_srvs::_Pose::Request &request, fulanghua_srvs::_Pose::Response &response) {
         if(!has_activate_) {
             response.status = false;
             return false;
@@ -224,7 +330,7 @@ public:
         clear_costmaps_srv_.call(empty);
 
         double min_dist = std::numeric_limits<double>::max();
-        for(std::vector<geometry_msgs::Pose>::iterator it = current_waypoint_; it != finish_pose_; it++) {
+        for(std::vector<orne_waypoints_msgs::Pose>::iterator it = current_waypoint_; it != finish_pose_; it++) {
             double dist = hypot(it->position.x - robot_gl.getOrigin().x(), it->position.y - robot_gl.getOrigin().y());
             if(dist < min_dist) {
                 min_dist = dist;
@@ -252,6 +358,24 @@ public:
         }
     }
 
+    // void actionExeCallback(const std_msgs::Bool &msg){
+    //     if(msg.data){
+            
+    //     }else{
+    //         action_finished = ;
+    //     }
+    // }
+
+    bool action_service_stop_callback(std_srvs::Empty::Request& req, std_srvs::Empty::Response& re){
+        ROS_INFO("Finshing action");
+        action_client.cancelGoal();
+        // re.success = true;
+    }
+
+    void needChargeCallback(const std_msgs::Bool &msg){
+        CHARGE = msg.data;
+    }
+
     bool readFile(const std::string &filename){
         waypoints_.poses.clear();
         try{
@@ -276,14 +400,20 @@ public:
                 const YAML::Node *wp_node = node.FindValue("waypoints");
             #endif
 
-            geometry_msgs::Pose pose;
+            orne_waypoints_msgs::Pose pose;
+
             if(wp_node != NULL){
                 for(int i=0; i < wp_node->size(); i++){
-
-                    (*wp_node)[i]["point"]["x"] >> pose.position.x;
-                    (*wp_node)[i]["point"]["y"] >> pose.position.y;
-                    (*wp_node)[i]["point"]["z"] >> pose.position.z;
-
+                    (*wp_node)[i]["point"]["pose"]["x"] >> pose.position.x;
+                    (*wp_node)[i]["point"]["pose"]["y"] >> pose.position.y;
+                    (*wp_node)[i]["point"]["pose"]["z"] >> pose.position.z;
+                    (*wp_node)[i]["point"]["action"]["a"] >> pose.position.action;
+                    (*wp_node)[i]["point"]["action"]["d"] >> pose.position.duration;
+                    (*wp_node)[i]["point"]["action"]["f"] >> pose.position.file;
+                    (*wp_node)[i]["point"]["orientation"]["x"] >> pose.orientation.x;
+                    (*wp_node)[i]["point"]["orientation"]["y"] >> pose.orientation.y;
+                    (*wp_node)[i]["point"]["orientation"]["z"] >> pose.orientation.z;
+                    (*wp_node)[i]["point"]["orientation"]["w"] >> pose.orientation.w;
                     waypoints_.poses.push_back(pose);
 
                 }
@@ -325,19 +455,43 @@ public:
     }
 
    void computeWpOrientation(){
-        for(std::vector<geometry_msgs::Pose>::iterator it = waypoints_.poses.begin(); it != finish_pose_; it++) {
-            double goal_direction = atan2((it+1)->position.y - (it)->position.y,
-                                          (it+1)->position.x - (it)->position.x);
-            (it)->orientation = tf::createQuaternionMsgFromYaw(goal_direction);
+        for(std::vector<orne_waypoints_msgs::Pose>::iterator it = waypoints_.poses.begin(); it != finish_pose_; it++) {
+            if(it->position.action =="passthrough" || it->position.action =="p2p"){
+                double goal_direction = atan2((it+1)->position.y - (it)->position.y,
+                                (it+1)->position.x - (it)->position.x);
+                (it)->orientation = tf::createQuaternionMsgFromYaw(goal_direction);
+            }
+            if(it->position.action=="charge"){
+                charging_waypoints_.poses.push_back(*it);
+                CHARGING_STATION =true;
+            }
         }
         waypoints_.header.frame_id = world_frame_;
+        if(CHARGING_STATION)
+             charging_waypoints_.header.frame_id = world_frame_;
+    }
+    void computeWpOrientationReverse(){
+        for(std::vector<orne_waypoints_msgs::Pose>::iterator it = finish_pose_; it != waypoints_.poses.begin(); it--) {
+            if(it->position.action =="passthrough" || it->position.action =="p2p"){
+                double goal_direction = atan2((it-1)->position.y -(it)->position.y,
+                                 (it-1)->position.x -(it)->position.x);
+                (it)->orientation = tf::createQuaternionMsgFromYaw(goal_direction);
+            }
+            if(it->position.action=="charge"){
+                charging_waypoints_.poses.push_back(*it);
+                CHARGING_STATION =true;
+            }
+        }
+        waypoints_.header.frame_id = world_frame_;
+        if(CHARGING_STATION)
+             charging_waypoints_.header.frame_id = world_frame_;
     }
 
     bool shouldSendGoal(){
         bool ret = true;
         actionlib::SimpleClientGoalState state = move_base_action_.getState();
         if((state != actionlib::SimpleClientGoalState::ACTIVE) &&
-           (state != actionlib::SimpleClientGoalState::PENDING) && 
+           (state != actionlib::SimpleClientGoalState::PENDING) &&  
            (state != actionlib::SimpleClientGoalState::RECALLED) &&
            (state != actionlib::SimpleClientGoalState::PREEMPTED))
         {
@@ -355,7 +509,11 @@ public:
         return move_base_action_.getState() == actionlib::SimpleClientGoalState::SUCCEEDED;
     }
 
-    bool onNavigationPoint(const geometry_msgs::Point &dest, double dist_err = 0.8){
+    bool chargingFinished(){
+        return !CHARGE;
+    }
+
+    bool onNavigationPoint(const orne_waypoints_msgs::Waypoint &dest, double dist_err = 0.8){
         tf::StampedTransform robot_gl = getRobotPosGL();
 
         const double wx = dest.x;
@@ -369,8 +527,13 @@ public:
 
     tf::StampedTransform getRobotPosGL(){
         tf::StampedTransform robot_gl;
+        geometry_msgs::Point pt;
         try{
             tf_listener_.lookupTransform(world_frame_, robot_frame_, ros::Time(0.0), robot_gl);
+            pt.x = robot_gl.getOrigin().x();
+            pt.y = robot_gl.getOrigin().y();
+            location_update(robot_gl);
+            robot_coordinate_pub.publish(pt);
         }catch(tf::TransformException &e){
             ROS_WARN_STREAM("tf::TransformException: " << e.what());
         }
@@ -383,40 +546,135 @@ public:
         ros::spinOnce();
         publishPoseArray();
     }
-
-    void startNavigationGL(const geometry_msgs::Point &dest){
-        geometry_msgs::Pose pose;
-        pose.position = dest;
-        pose.orientation = tf::createQuaternionMsgFromYaw(0.0);
-        startNavigationGL(pose);
+    
+    
+    void actionServiceCall(const std::vector<orne_waypoints_msgs::Pose>::iterator &dest){
+        bool initial_goal = false;
+        if (action_client.isServerConnected())
+        {
+            fulanghua_action::special_moveGoal goal;
+            // goal.task_id = task_id;
+            ROS_WARN("goal setting");
+            goal.command = dest->position.action;
+            if(dest->position.action == "p2p" ){
+                std::vector<orne_waypoints_msgs::Pose>::iterator target;
+                if(_reached && REVERSE){
+                    target = dest-1;
+                }else{
+                    target = dest+1;
+                }
+                goal.wp.position = target->position;
+                goal.wp.orientation = target->orientation;
+                actionServiceCall(makeQueue("p2p"));
+            }else{
+                goal.wp.position = dest->position;
+                goal.wp.orientation = dest->orientation;
+            }
+            goal.duration = INT_MAX;
+            goal.file = dest->position.file;
+            std::cout <<"publish command:" << goal.command;
+            action_client.sendGoal(goal);
+            actionlib::SimpleClientGoalState state = action_client.getState();
+            if(goal.command == "stop")
+                actionServiceCall(makeQueue("stop"));
+            while(state !=actionlib::SimpleClientGoalState::PREEMPTED){
+                getRobotPosGL();
+                state = action_client.getState();
+                // if (initial_goal)
+                //     printf("Current State: %s\n", action_client.getState().toString().c_str());
+                sleep();
+            }
+            if((goal.wp.position.x != 0 && goal.wp.position.y != 0) && (goal.wp.orientation.x != 0 && goal.wp.orientation.y != 0))
+                actionServiceCall(makeQueue("next"));
+            printf("Action finished\n");
+        }   
+        rate_.sleep();
     }
 
-    void startNavigationGL(const geometry_msgs::Pose &dest){
+    void location_update(const tf::StampedTransform& robot_gl){
+        std::ofstream ofs(amcl_filename_.c_str(), std::ios::out);
+        tf::Quaternion q(
+                robot_gl.getRotation().x(),
+                robot_gl.getRotation().y(),
+                robot_gl.getRotation().z(),
+                robot_gl.getRotation().w());
+        tf::Matrix3x3 m(q);
+        double roll, pitch, yaw;
+        m.getRPY(roll, pitch, yaw);
+        ofs << "initial_pose_x: " << robot_gl.getOrigin().x()  <<std::endl;
+        ofs << "initial_pose_y: " << robot_gl.getOrigin().y() <<std::endl;
+        ofs << "initial_pose_a: " << yaw << std::endl;
+        // printf("yaw: %f\n", yaw);
+        ofs.close();
+    }
+    void startNavigationGL(const orne_waypoints_msgs::Pose &dest){
         move_base_msgs::MoveBaseGoal move_base_goal;
         move_base_goal.target_pose.header.stamp = ros::Time::now();
         move_base_goal.target_pose.header.frame_id = world_frame_;
-        move_base_goal.target_pose.pose.position = dest.position;
+        move_base_goal.target_pose.pose.position.x = dest.position.x;
+        move_base_goal.target_pose.pose.position.y = dest.position.y;
+        move_base_goal.target_pose.pose.position.z = dest.position.z;
         move_base_goal.target_pose.pose.orientation = dest.orientation;
         
         move_base_action_.sendGoal(move_base_goal);
     }
 
-    
+    bool actionConfirm(const orne_waypoints_msgs::Pose &dest){
+        if(dest.position.action == "passthrough") return false;
+        return true;
+    }
     void publishPoseArray(){
         waypoints_.header.stamp = ros::Time::now();
         wp_pub_.publish(waypoints_);
     }
 
+    std::vector<orne_waypoints_msgs::Pose>::iterator nearestChargingStation(const std::vector<orne_waypoints_msgs::Pose>::iterator &current_waypoint_){
+        /*calculate the distance from the current position to each charging station
+            this is kind of like the simplest way to decide which station is the nearest by Pythagorean theorem
+            but idealy, I think we should use the A stat algorithm to find the nearest path to reach the station since there is a possibility that the robot cannot 
+            reach the goal in the shortest way due to some obstacles.
+            Therefore if I find the below conditions, I will change the way
+            1. get the entiere map
+            2. every cell can be cateogorized as 0 or 1 0 for empty and 1 for obstacles.
+            3. get the minimun number of cells needed to make the robot pass through 
+
+            If these requiremnets are satisfied, then the most reliable way to find the nearest chaging station will be made.
+        */
+        std::vector<orne_waypoints_msgs::Pose>::iterator _charging_waypoint = charging_waypoints_.poses.begin();
+        double nearest = std::sqrt(std::pow(std::abs(current_waypoint_->position.x - _charging_waypoint->position.x),2) + std::pow(std::abs(current_waypoint_->position.y - _charging_waypoint->position.y),2));
+        for(std::vector<orne_waypoints_msgs::Pose>::iterator it = charging_waypoints_.poses.begin(); it != charging_waypoints_.poses.end(); it++) {
+            double distance = std::sqrt(std::pow(std::abs(current_waypoint_->position.x - it->position.x),2) + std::pow(std::abs(current_waypoint_->position.y - it->position.y),2));
+            if(distance < nearest){
+                nearest = distance;
+                _charging_waypoint = it;
+            }
+        }
+        return _charging_waypoint;
+    }
     void run(){
         while(ros::ok()){
+            getRobotPosGL();
             try {
                 if(has_activate_) {
-                    if(current_waypoint_ == last_waypoint_) {
+                    if(current_waypoint_->position.action == "charge" && CHARGING_STATION){
+                        if(_reached && REVERSE){
+                            current_waypoint_--;
+                        }else{
+                            current_waypoint_++;
+                        }
+                    }
+                    if(current_waypoint_ == last_waypoint_ && !REVERSE) {
                         ROS_INFO("prepare finish pose");
-                    } else {
+                    } else if (current_waypoint_ == first_waypoint_+1 && REVERSE && _reached){
+                        ROS_INFO("prepare finish pose");
+                    }else {
                         ROS_INFO("calculate waypoint direction");
                         ROS_INFO_STREAM("goal_direction = " << current_waypoint_->orientation);
-                        ROS_INFO_STREAM("current_waypoint_+1 " << (current_waypoint_+1)->position.y);
+                        if(REVERSE && _reached){
+                            ROS_INFO_STREAM("current_waypoint_-1 " << (current_waypoint_-1)->position.y);
+                        }else{
+                            ROS_INFO_STREAM("current_waypoint_+1 " << (current_waypoint_+1)->position.y);
+                        }
                         ROS_INFO_STREAM("current_waypoint_" << current_waypoint_->position.y);
                     }
 
@@ -436,20 +694,97 @@ public:
                             resend_goal++;
                             if(resend_goal == 3) {
                                 ROS_WARN("Skip waypoint.");
-                                current_waypoint_++;
+                                actionServiceCall(makeQueue("skip"));
+                                if(REVERSE && _reached)
+                                    current_waypoint_--;
+                                else
+                                    current_waypoint_++;
+                                if(current_waypoint_->position.action == "charge"){
+                                    if(_reached && REVERSE){
+                                        current_waypoint_--;
+                                    }else{
+                                        current_waypoint_++;
+                                    }
+                                }
                                 startNavigationGL(*current_waypoint_);
                             }
                             start_nav_time = time;
                         }
                         sleep();
                     }
-
-                    current_waypoint_++;
-                    if(current_waypoint_ == finish_pose_) {
+                    //do the action here
+                    //call the function that calls service with action code
+                    if(CHARGE && CHARGING_STATION ){
+                        charging_waypoint_ = nearestChargingStation(current_waypoint_);
+                        startNavigationGL(*charging_waypoint_);
+                        while(!navigationFinished() && ros::ok()) sleep();
+                        has_activate_ = false;
+                        while(!chargingFinished() && ros::ok()) sleep();
+                    }else{
+                        orne_waypoints_msgs::Pose temp_wp;
+                        if(_reached && REVERSE){
+                            if((current_waypoint_-1)->position.action =="p2p"){
+                                temp_wp.position.action = current_waypoint_->position.action;
+                                current_waypoint_->position.action = (current_waypoint_-1)->position.action;
+                                (current_waypoint_-1)->position.action = temp_wp.position.action;
+                                p2p_flag = true;
+                            }
+                        }
+                        if(actionConfirm(*current_waypoint_)){
+                            while(!navigationFinished() && ros::ok()) sleep();
+                            has_activate_ = false;
+                            actionServiceCall(current_waypoint_);
+                            if (p2p_flag){
+                                ROS_WARN("reversed p2p");
+                                current_waypoint_--;
+                                startNavigationGL(*current_waypoint_);
+                                while(!navigationFinished() && ros::ok()) sleep();
+                                current_waypoint_->position.action = (current_waypoint_+1)->position.action;
+                                (current_waypoint_+1)->position.action = temp_wp.position.action;
+                                p2p_flag = false;
+                            } 
+                            has_activate_ = true;
+                        }
+                    }
+                    
+                    if(_reached && REVERSE){
+                        current_waypoint_--;
+                    }else{
+                        current_waypoint_++;
+                    }
+                    if(current_waypoint_ == finish_pose_ && !REVERSE) {
+                        startNavigationGL(*current_waypoint_);
+                        while(!navigationFinished() && ros::ok()) sleep();
+                        has_activate_ = false;
+                        if(LOOP){
+                            actionServiceCall(makeQueue("loop"));
+                            has_activate_ = true;
+                            current_waypoint_ = waypoints_.poses.begin();
+                        }else{
+                            actionServiceCall(makeQueue("finish"));
+                        }
+                    }else if (current_waypoint_ == finish_pose_ && REVERSE){
+                        // startNavigationGL(*current_waypoint_);
+                        // while(!navigationFinished() && ros::ok()) sleep();
+                        ROS_INFO_STREAM("REVERSE start!");
+                        actionServiceCall(makeQueue("reverse"));
+                        computeWpOrientationReverse();
+                        current_waypoint_--;
+                        _reached = true;
+                    }
+                    if(_reached && LOOP && current_waypoint_ == first_waypoint_){
+                        has_activate_ = true;
+                        computeWpOrientation();
+                        startNavigationGL(*current_waypoint_);
+                        while(!navigationFinished() && ros::ok()) sleep();
+                        current_waypoint_++;
+                        _reached = false;
+                    }else if(_reached && !LOOP && current_waypoint_ == first_waypoint_ ){
                         startNavigationGL(*current_waypoint_);
                         while(!navigationFinished() && ros::ok()) sleep();
                         has_activate_ = false;
                     }
+                    
                 }
             } catch(const SwitchRunningStatus &e) {
                 ROS_INFO_STREAM("running status switched");
@@ -461,21 +796,33 @@ public:
 
 private:
     actionlib::SimpleActionClient<move_base_msgs::MoveBaseAction> move_base_action_;
-    geometry_msgs::PoseArray waypoints_;
+    actionlib::SimpleActionClient<fulanghua_action::special_moveAction> action_client;
+    std::string amcl_filename_;
+    // geometry_msgs::PoseArray waypoints_;
+    orne_waypoints_msgs::WaypointArray waypoints_, charging_waypoints_ ;
     visualization_msgs::MarkerArray marker_;
-    std::vector<geometry_msgs::Pose>::iterator current_waypoint_;
-    std::vector<geometry_msgs::Pose>::iterator last_waypoint_;
-    std::vector<geometry_msgs::Pose>::iterator finish_pose_;
+    std::vector<orne_waypoints_msgs::Pose>::iterator current_waypoint_;
+    std::vector<orne_waypoints_msgs::Pose>::iterator charging_waypoint_;
+    std::vector<orne_waypoints_msgs::Pose>::iterator last_waypoint_;
+    std::vector<orne_waypoints_msgs::Pose>::iterator first_waypoint_;
+    std::vector<orne_waypoints_msgs::Pose>::iterator finish_pose_;
     bool has_activate_;
-    std::string robot_frame_, world_frame_;
+    std::string robot_frame_, world_frame_, cmd_vel_, CHARGE_TOPIC, robot_name_;
     tf::TransformListener tf_listener_;
     ros::Rate rate_;
-    ros::ServiceServer start_server_, pause_server_, unpause_server_, stop_server_, suspend_server_, resume_server_ ,search_server_;
-    ros::Subscriber cmd_vel_sub_;
-    ros::Publisher wp_pub_;
-    ros::ServiceClient clear_costmaps_srv_;
+    ros::ServiceServer start_server_, pause_server_, unpause_server_, stop_server_, suspend_server_, 
+    resume_server_ ,search_server_, loop_start_server, loop_stop_server, roundtrip_on_server_, roundtrip_off_server_, command_server;
+    ros::Subscriber cmd_vel_sub_, charge_sub;
+    ros::Publisher wp_pub_, cmd_vel_pub_, robot_coordinate_pub;
+    ros::ServiceClient clear_costmaps_srv_, action_cmd_srv;
     double last_moved_time_, dist_err_;
-
+    bool LOOP = false;
+    bool REVERSE = false;
+    bool action_finished = false;
+    bool CHARGE =false;
+    bool CHARGING_STATION=false;
+    bool _reached = false;
+    bool p2p_flag =false;
 };
 
 int main(int argc, char *argv[]){

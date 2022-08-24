@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<launch>
+<arg name="world_frame"       default="map"/>
+<arg name="robot_name"       default="go1"/>
+<arg name="waypoints_file" default="$(find orne_waypoints_editor)/waypoints_cfg/waypoints.yaml"/>
+<arg name="amcl_filename" default="$(find fulanghua_waypoints_nav)/param/initial_pose.yaml"/>
+<arg name="voice_path" default="$(find fulanghua_waypoints_nav)/voice/"/>
+<arg name="dist_err"       default="0.8"/>
+<arg name="cmd_vel"         default="cmd_vel"/>
+<arg name="max_vel"         default="0.4"/>
+<arg name="min_vel"         default="0.1"/>
+<arg name="volume"         default="2.0"/>
+
+  <node name="waypoints_nav" pkg="fulanghua_waypoints_nav" type="waypoints_nav" output="screen">
+  <param name="world_frame" value="$(arg world_frame)"/>
+    <param name="filename" value="$(arg waypoints_file)"/>
+    <param name="amcl_filename" value="$(arg amcl_filename)"/>
+    <param name="cmd_vel"  value="$(arg cmd_vel)" />
+    <param name="robot_name"  value="$(arg robot_name)" />
+
+  </node>
+  <node name="action_server" pkg="fulanghua_action" type="adv_action_server" output="screen">
+     <param name="dist_err" value="$(arg dist_err)"/> 
+     <param name="cmd_vel"  value="$(arg cmd_vel)" />
+     <param name="max_vel"  value="$(arg max_vel)" />
+     <param name="min_vel"  value="$(arg min_vel)" />
+     <param name="voice_path"  value="$(arg voice_path)" />
+     <param name="volume"  value="$(arg volume)" />
+  </node>
+  <include file="$(find sound_play)/soundplay_node.launch"></include>
+</launch>
