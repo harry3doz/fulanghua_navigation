@@ -1,0 +1,68 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="world_frame"       default="map"/>
+    <arg name="robot_name"       default="go1"/>
+    <arg name="lang"              default="eng"/>
+    <arg name="voice_path" default="$(find fulanghua_waypoints_nav)/voice/$(arg lang)/"/>
+    <arg name="dist_err"       default="0.8"/>
+    <arg name="charge_threshold_lower"       default="10.0"/>
+    <arg name="charge_threshold_higher"       default="11.4"/>
+    <arg name="cmd_vel"         default="cmd_vel"/>
+    <arg name="max_vel"         default="0.4"/>
+    <arg name="min_vel"         default="0.1"/>
+    <arg name="volume"         default="2.0"/>
+    <arg name="Kp"       default="2.0"/> 
+    <arg name="offset_fixed_x" default="0.009"/>
+    <arg name="offset_fixed_y" default="0.02"/>
+    <arg name="offset_fixed_z" default="0.285"/>
+    <arg name="holonomic" default="true"/>
+    <arg name="image_topic" default="/usb_cam2/image_raw"/>
+    <arg name="calibration_path" default="$(find camera_pkg)/param"/> 
+    <arg name="high_cmd" default="high_cmd"/> 
+
+    <node name="action_server" pkg="fulanghua_waypoints_nav" type="adv_action_server" output="screen">
+        <param name="robot_name" value="$(arg robot_name)"/>
+        <param name="dist_err" value="$(arg dist_err)"/> 
+        <param name="cmd_vel"  value="$(arg cmd_vel)" />
+        <param name="max_vel"  value="$(arg max_vel)" />
+        <param name="min_vel"  value="$(arg min_vel)" />
+        <param name="holonomic" value="$(arg holonomic)" />
+        <param name="voice_path"  value="$(arg voice_path)" />
+        <param name="volume"  value="$(arg volume)" />
+        <param name="charge_threshold_higher"  value="$(arg charge_threshold_higher)" />
+    </node>
+
+    <node name="rotate_server" pkg="fulanghua_waypoints_nav" type="rotate_action_server" output="screen">
+        <param name="dist_err" value="$(arg dist_err)"/> 
+        <param name="cmd_vel"  value="$(arg cmd_vel)" />
+        <param name="max_vel"  value="$(arg max_vel)" />
+        <param name="min_vel"  value="$(arg min_vel)" />
+        <param name="voice_path"  value="$(arg voice_path)" />
+        <param name="volume"  value="$(arg volume)" />
+        <param name="Kp"  value="$(arg Kp)" />
+    </node>
+    
+    <node name="ar_detect_server" pkg="fulanghua_waypoints_nav" type="aruco_detect_server" output="screen">
+        <param name="cmd_vel"  value="$(arg cmd_vel)" />
+        <param name="image_topic" value="$(arg image_topic)"/>
+        <param name="Kp"  value="$(arg Kp)" />
+        <param name="adjust_speed" value="$(arg min_vel)"/>
+        <param name="offset_fixed_x" value="$(arg offset_fixed_x)"/>
+        <param name="offset_fixed_y" value="$(arg offset_fixed_y)"/>
+        <param name="offset_fixed_z" value="$(arg offset_fixed_z)"/>
+        <param name="holonomic" value="$(arg holonomic)" />
+        <param name="calibration_path" value="$(arg calibration_path)/camera_ext.yaml" />
+    </node>
+
+    
+    <node name="go1_cmd_server" pkg="fulanghua_waypoints_nav" type="go1_cmd_server" output="screen">
+        <param name="high_cmd" value="$(arg high_cmd)"/> 
+    </node>
+
+
+    <node name="battery_check_server" pkg="fulanghua_waypoints_nav" type="battery_check_server" output="screen">
+        <param name="robot_name" value="$(arg robot_name)"/>
+        <param name="charge_threshold_higher"  value="$(arg charge_threshold_higher)" />
+    </node>
+
+</launch>

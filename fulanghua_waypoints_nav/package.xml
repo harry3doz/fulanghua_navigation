@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<package>
+<package format="2">
   <name>fulanghua_waypoints_nav</name>
   <version>0.0.1</version>
   <description>The fulanghua_waypoints package</description>
@@ -11,27 +11,27 @@
 
   <buildtool_depend>catkin</buildtool_depend>
   
-  <build_depend>move_base</build_depend>
-  <build_depend>yaml-cpp</build_depend>
-  <build_depend>move_base_msgs</build_depend>
-  <build_depend>geometry_msgs</build_depend>
-  <build_depend>roscpp</build_depend>
-  <build_depend>actionlib_msgs</build_depend>
-  <build_depend>actionlib</build_depend>
-  <build_depend>tf</build_depend>
-  <build_depend>std_srvs</build_depend>
-  <build_depend>orne_waypoints_msgs</build_depend>
-  <build_depend>fulanghua_srvs</build_depend>
-  <build_depend>fulanghua_action</build_depend>
-  <run_depend>move_base</run_depend>
-  <run_depend>yaml-cpp</run_depend>
-  <run_depend>move_base_msgs</run_depend>
-  <run_depend>geometry_msgs</run_depend>
-  <run_depend>roscpp</run_depend>
-  <run_depend>actionlib_msgs</run_depend>
-  <run_depend>actionlib</run_depend>
-  <run_depend>tf</run_depend>
-  <run_depend>std_srvs</run_depend>
+  <depend>move_base_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>move_base</depend>
+  <depend>roscpp</depend>
+  <depend>actionlib_msgs</depend>
+  <depend>actionlib</depend>
+  <depend>tf</depend>
+  <depend>std_srvs</depend>
+  <depend>fulanghua_action</depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>orne_waypoints_msgs</depend>
+  <depend>sound_play</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+  <depend>camera_action</depend>
+  <depend>fulanghua_msg</depend>
+  <depend>fulanghua_srvs</depend>
+  <depend>unitree_legged_msgs</depend>
+  
+  
   <!-- <run_depend>fulanghua_srvs</run_depend> -->
 
   <export>

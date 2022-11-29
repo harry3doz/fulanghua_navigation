@@ -31,6 +31,7 @@
 #include <ros/ros.h>
 #include <std_srvs/Trigger.h>
 #include <std_srvs/Empty.h>
+#include <std_srvs/SetBool.h>
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Twist.h>
@@ -53,6 +54,8 @@
 #include <exception>
 #include <math.h>
 #include <limits>
+#include <fulanghua_msg/_LimoStatus.h>
+#include "std_msgs/Bool.h"
 
 #ifdef NEW_YAMLCPP
 template<typename T>
@@ -73,6 +76,8 @@ public:
         has_activate_(false),
         move_base_action_("move_base", true),
         action_client("action", true),
+        rotate_client("rotate", true),
+        battery_check_client("battery_check", true),
         rate_(10),
         last_moved_time_(0),
         dist_err_(0.8),
@@ -85,10 +90,17 @@ public:
         
         ros::NodeHandle private_nh("~");
         private_nh.param("robot_frame", robot_frame_, std::string("base_link"));
-        private_nh.param("robot_naame", robot_name_, std::string("go1"));
+        private_nh.param("robot_name", robot_name_, std::string("go1"));
+        private_nh.param("charge_threshold_lower", charge_threshold_lower_, 10.0);
+        private_nh.param("charge_threshold_higher", charge_threshold_higher_, 12.0);
+        if (robot_name_ !="go1"){
+            #define LIMO
+            CHARGE_TOPIC = "/limo_status";
+        }else{
+            CHARGE_TOPIC = "/go1_status";
+        }
         private_nh.param("world_frame", world_frame_, std::string("map"));
         private_nh.param("cmd_vel", cmd_vel_, std::string("cmd_vel"));
-        private_nh.param("charge_topic", CHARGE_TOPIC, std::string("charge"));
         private_nh.param("amcl_filename", amcl_filename_,amcl_filename_);
         double max_update_rate;
         private_nh.param("max_update_rate", max_update_rate, 10.0);
@@ -124,12 +136,17 @@ public:
         resume_server_ = nh.advertiseService("resume_wp_pose", &WaypointsNavigation::resumePoseCallback, this);
         search_server_ = nh.advertiseService("near_wp_nav",&WaypointsNavigation::searchPoseCallback, this);
         cmd_vel_sub_ = nh.subscribe(cmd_vel_, 1, &WaypointsNavigation::cmdVelCallback, this);
-        cmd_vel_pub_ = nh.advertise<geometry_msgs::Twist>(cmd_vel_,1000);
-        robot_coordinate_pub = nh.advertise<geometry_msgs::Point>("robot_coordinate",1000);
-        // action_exe_sub = nh.subscribe("cmd_vel_executing", 1000, &WaypointsNavigation::actionExeCallback, this);
-        charge_sub = nh.subscribe(CHARGE_TOPIC, 1000, &WaypointsNavigation::needChargeCallback, this);
+        cmd_vel_pub_ = nh.advertise<geometry_msgs::Twist>(cmd_vel_,100);
+        robot_coordinate_pub = nh.advertise<geometry_msgs::Point>("robot_coordinate",100);
+        
+        #ifdef LIMO
+            charge_sub = nh.subscribe(CHARGE_TOPIC, 100, &WaypointsNavigation::limo_batteryCallback, this);
+        #else
+            charge_sub = nh.subscribe(CHARGE_TOPIC, 100, &WaypointsNavigation::go1_batteryCallback, this);
+        #endif
         wp_pub_ = nh.advertise<orne_waypoints_msgs::WaypointArray>("waypoints", 10);
         clear_costmaps_srv_ = nh.serviceClient<std_srvs::Empty>("/move_base/clear_costmaps");
+        charge_reset_srv = nh.serviceClient<std_srvs::Empty>(ARUCO_DETECT_SERVICE_RESET);
         action_cmd_srv = nh.serviceClient<fulanghua_srvs::actions>("/action/start");
         //added below
         loop_start_server = nh.advertiseService("loop_start_wp_nav", &WaypointsNavigation::loopStartCallback, this);
@@ -165,7 +182,7 @@ public:
         
         orne_waypoints_msgs::WaypointArray dummy_array;
         orne_waypoints_msgs::Pose pose;
-        pose.position.action = "speak";
+        pose.position.action = "guide";
         pose.position.file = command;
         pose.position.duration = INT_MAX;
         pose.position.x =0;
@@ -175,17 +192,15 @@ public:
         pose.orientation.y =0;
         pose.orientation.z =0;
         pose.orientation.w =0;
-        ROS_WARN("Made it");
         dummy_array.poses.push_back(pose);
         return dummy_array.poses.begin();
     }
 
-    std::vector<orne_waypoints_msgs::Pose>::iterator makeQueue(const std::string& command1, const std::string& command2){
-        std::vector<orne_waypoints_msgs::Pose>::iterator dummy;
+    std::vector<orne_waypoints_msgs::Pose>::iterator makeQueue(const std::string& command, const int& duration){
+        orne_waypoints_msgs::WaypointArray dummy_array;
         orne_waypoints_msgs::Pose pose;
-        pose.position.action = command1;
-        pose.position.file = command2;
-        pose.position.duration = INT_MAX;
+        pose.position.action = command;
+        pose.position.duration = duration;
         pose.position.x =0;
         pose.position.y =0;
         pose.position.z =0;
@@ -193,7 +208,8 @@ public:
         pose.orientation.y =0;
         pose.orientation.z =0;
         pose.orientation.w =0;
-        return dummy;
+        dummy_array.poses.push_back(pose);
+        return dummy_array.poses.begin();
     }
 
     bool startNavigationCallback(std_srvs::Trigger::Request &request, std_srvs::Trigger::Response &response) {
@@ -233,8 +249,6 @@ public:
 
         current_waypoint_ = waypoints_.poses.begin();
         ROS_WARN("Start!");
-        std::string rname = "guide_" + robot_name_;
-        actionServiceCall(makeQueue(rname));
         has_activate_ = true;
         response.success = true;
         return true;
@@ -343,7 +357,65 @@ public:
 
         return true;
     }
-    
+    void callRotateClient(){
+        if (rotate_client.isServerConnected()){
+              bool state =true;
+              
+              fulanghua_action::special_moveGoal current_goal;
+              current_goal.duration = 20;
+              current_goal.angle = -90;
+              for (int i = 0; i < 5; i++)
+              {
+                rotate_client.sendGoal(current_goal);
+                actionlib::SimpleClientGoalState client_state = rotate_client.getState();
+                while(client_state !=actionlib::SimpleClientGoalState::SUCCEEDED){
+                  client_state = rotate_client.getState();
+                  if (client_state == actionlib::SimpleClientGoalState::PREEMPTED
+                    || client_state == actionlib::SimpleClientGoalState::ABORTED){
+                    ROS_WARN("failed %d times\n", i+1);
+                    state = false;
+                    break;
+                  }
+                  ros::Duration(0.1).sleep();
+                }
+                if (state){
+                //    rotate_client.cancelAllGoals();
+                   break;
+                }
+              }
+              ros::Duration(1).sleep();
+            }
+    }
+
+    void battery_check(){
+        if(battery_check_client.isServerConnected()){
+              bool state =true;
+              fulanghua_action::special_moveGoal current_goal;
+              current_goal.duration = INT_MAX-1;
+              for (int i = 0; i < 5; i++)
+              {
+                battery_check_client.sendGoal(current_goal);
+                actionlib::SimpleClientGoalState client_state = battery_check_client.getState();
+                while(client_state !=actionlib::SimpleClientGoalState::SUCCEEDED){
+                  client_state = battery_check_client.getState();
+                  if (client_state == actionlib::SimpleClientGoalState::PREEMPTED
+                    || client_state == actionlib::SimpleClientGoalState::ABORTED){
+                    ROS_WARN("failed %d times\n", i+1);
+                    state = false;
+                    break;
+                  }
+                  ros::Duration(0.1).sleep();
+                }
+                if (state){
+                    // battery_check_client.cancelAllGoals();
+                    break;
+                }
+
+              }
+              ros::Duration(1).sleep();
+        }
+    }
+
     void cmdVelCallback(const geometry_msgs::Twist &msg){
         if(msg.linear.x > -0.001 && msg.linear.x < 0.001   &&
            msg.linear.y > -0.001 && msg.linear.y < 0.001   &&
@@ -358,23 +430,22 @@ public:
         }
     }
 
-    // void actionExeCallback(const std_msgs::Bool &msg){
-    //     if(msg.data){
-            
-    //     }else{
-    //         action_finished = ;
-    //     }
-    // }
-
     bool action_service_stop_callback(std_srvs::Empty::Request& req, std_srvs::Empty::Response& re){
         ROS_INFO("Finshing action");
         action_client.cancelGoal();
         // re.success = true;
     }
 
-    void needChargeCallback(const std_msgs::Bool &msg){
-        CHARGE = msg.data;
+    void limo_batteryCallback(const fulanghua_msg::_LimoStatus &msg){
+        battery_ = msg.battery_voltage;
+        if (battery_<charge_threshold_lower_){
+            CHARGE =true;
+            battery_ = msg.battery_voltage;
+        }else if (battery_>=charge_threshold_higher_){
+            CHARGE =false;
+        }
     }
+
 
     bool readFile(const std::string &filename){
         waypoints_.poses.clear();
@@ -550,45 +621,71 @@ public:
     
     void actionServiceCall(const std::vector<orne_waypoints_msgs::Pose>::iterator &dest){
         bool initial_goal = false;
-        if (action_client.isServerConnected())
-        {
-            fulanghua_action::special_moveGoal goal;
-            // goal.task_id = task_id;
-            ROS_WARN("goal setting");
-            goal.command = dest->position.action;
-            if(dest->position.action == "p2p" ){
-                std::vector<orne_waypoints_msgs::Pose>::iterator target;
-                if(_reached && REVERSE){
-                    target = dest-1;
-                }else{
-                    target = dest+1;
-                }
-                goal.wp.position = target->position;
-                goal.wp.orientation = target->orientation;
-                actionServiceCall(makeQueue("p2p"));
-            }else{
+        for (int i = 0; i < 5; i++){
+            bool state = true;
+            if (action_client.isServerConnected())
+            {
+                fulanghua_action::special_moveGoal goal;
+                // goal.task_id = task_id;
+                ROS_WARN("goal setting");
+                goal.command = dest->position.action;
                 goal.wp.position = dest->position;
                 goal.wp.orientation = dest->orientation;
+                goal.duration = INT_MAX;
+                goal.file = dest->position.file;
+                std::cout <<"publish command:" << goal.command << std::endl;
+                action_client.sendGoal(goal);
+                actionlib::SimpleClientGoalState client_state = action_client.getState();
+                while(client_state !=actionlib::SimpleClientGoalState::SUCCEEDED){
+                    getRobotPosGL();
+                    client_state = action_client.getState();
+                    if (client_state == actionlib::SimpleClientGoalState::PREEMPTED
+                        || client_state == actionlib::SimpleClientGoalState::ABORTED){
+                        ROS_WARN("failed %d times\n", i+1);
+                        state = false;
+                        break;
+                    }
+                ros::Duration(0.1).sleep();
+                }
+            }else{
+                break;
             }
-            goal.duration = INT_MAX;
-            goal.file = dest->position.file;
-            std::cout <<"publish command:" << goal.command;
-            action_client.sendGoal(goal);
-            actionlib::SimpleClientGoalState state = action_client.getState();
-            if(goal.command == "stop")
-                actionServiceCall(makeQueue("stop"));
-            while(state !=actionlib::SimpleClientGoalState::PREEMPTED){
-                getRobotPosGL();
-                state = action_client.getState();
-                // if (initial_goal)
-                //     printf("Current State: %s\n", action_client.getState().toString().c_str());
-                sleep();
+
+            if(state){
+                // if(goal.command =="charge"){
+                if(dest->position.action == "stop"){ //after all the experiment is done, then change the topic name to "charge" 
+                    ros::Duration(2).sleep();
+                    ROS_INFO("Waiting for the battery is fully charged");
+                    //here I need to call the battery check service 
+                    battery_check();
+                    ROS_INFO("Chagrging is done");
+
+                    //remvoe the hand from the outlet
+                    charge_reset_srv.call(req,res);
+                    //sleep 10 seconds
+                    ros::Duration(5).sleep();
+
+                    callRotateClient();
+                }
+                has_activate_ = true;
+                break;
+            }else if (i==4){
+                ROS_WARN("Failed the whole process 5 times so please call the operator to fix this");
+                stopNavigationCallback(req, res);
+                charge_reset_srv.call(req,res);
+                ros::Duration(10).sleep();
+                has_activate_ = false;
+                break;
+            }else{
+                ROS_WARN("You Failed %d times\n ", i+1);
+                continue;
             }
-            if((goal.wp.position.x != 0 && goal.wp.position.y != 0) && (goal.wp.orientation.x != 0 && goal.wp.orientation.y != 0))
-                actionServiceCall(makeQueue("next"));
-            printf("Action finished\n");
-        }   
         rate_.sleep();
+        }  
+        if((dest->position.x != 0 && dest->position.y != 0) && (dest->orientation.x != 0 && dest->orientation.y != 0)){
+            actionServiceCall(makeQueue("next"));
+            printf("Action finished\n");
+        }
     }
 
     void location_update(const tf::StampedTransform& robot_gl){
@@ -656,6 +753,12 @@ public:
             getRobotPosGL();
             try {
                 if(has_activate_) {
+                    if(_initial){
+                        std::string rname = "guide_" + robot_name_;
+                        actionServiceCall(makeQueue(rname));
+                        _initial=false;
+                    }
+                    
                     if(current_waypoint_->position.action == "charge" && CHARGING_STATION){
                         if(_reached && REVERSE){
                             current_waypoint_--;
@@ -686,7 +789,7 @@ public:
                             throw SwitchRunningStatus();
                         
                         double time = ros::Time::now().toSec();
-                        if(time - start_nav_time > 10.0 && time - last_moved_time_ > 10.0) {
+                        if(time - start_nav_time > 5.0 && time - last_moved_time_ > 5.0) {
                             ROS_WARN("Resend the navigation goal.");
                             std_srvs::Empty empty;
                             clear_costmaps_srv_.call(empty);
@@ -743,47 +846,49 @@ public:
                                 (current_waypoint_+1)->position.action = temp_wp.position.action;
                                 p2p_flag = false;
                             } 
-                            has_activate_ = true;
+                            
                         }
                     }
-                    
                     if(_reached && REVERSE){
                         current_waypoint_--;
                     }else{
                         current_waypoint_++;
                     }
-                    if(current_waypoint_ == finish_pose_ && !REVERSE) {
-                        startNavigationGL(*current_waypoint_);
-                        while(!navigationFinished() && ros::ok()) sleep();
-                        has_activate_ = false;
-                        if(LOOP){
-                            actionServiceCall(makeQueue("loop"));
-                            has_activate_ = true;
-                            current_waypoint_ = waypoints_.poses.begin();
-                        }else{
-                            actionServiceCall(makeQueue("finish"));
+                    if(has_activate_){
+                        if(current_waypoint_ == finish_pose_ && !REVERSE) {
+                            startNavigationGL(*current_waypoint_);
+                            while(!navigationFinished() && ros::ok()) sleep();
+                            has_activate_ = false;
+                            if(LOOP){
+                                actionServiceCall(makeQueue("loop"));
+                                has_activate_ = true;
+                                current_waypoint_ = waypoints_.poses.begin();
+                            }else{
+                                actionServiceCall(makeQueue("finish"));
+                            }
+                        }else if (current_waypoint_ == finish_pose_ && REVERSE){
+                            // startNavigationGL(*current_waypoint_);
+                            // while(!navigationFinished() && ros::ok()) sleep();
+                            ROS_INFO_STREAM("REVERSE start!");
+                            actionServiceCall(makeQueue("reverse"));
+                            computeWpOrientationReverse();
+                            current_waypoint_--;
+                            _reached = true;
                         }
-                    }else if (current_waypoint_ == finish_pose_ && REVERSE){
-                        // startNavigationGL(*current_waypoint_);
-                        // while(!navigationFinished() && ros::ok()) sleep();
-                        ROS_INFO_STREAM("REVERSE start!");
-                        actionServiceCall(makeQueue("reverse"));
-                        computeWpOrientationReverse();
-                        current_waypoint_--;
-                        _reached = true;
+                        if(_reached && LOOP && current_waypoint_ == first_waypoint_){
+                            has_activate_ = true;
+                            computeWpOrientation();
+                            startNavigationGL(*current_waypoint_);
+                            while(!navigationFinished() && ros::ok()) sleep();
+                            current_waypoint_++;
+                            _reached = false;
+                        }else if(_reached && !LOOP && current_waypoint_ == first_waypoint_ ){
+                            startNavigationGL(*current_waypoint_);
+                            while(!navigationFinished() && ros::ok()) sleep();
+                            has_activate_ = false;
+                        }
                     }
-                    if(_reached && LOOP && current_waypoint_ == first_waypoint_){
-                        has_activate_ = true;
-                        computeWpOrientation();
-                        startNavigationGL(*current_waypoint_);
-                        while(!navigationFinished() && ros::ok()) sleep();
-                        current_waypoint_++;
-                        _reached = false;
-                    }else if(_reached && !LOOP && current_waypoint_ == first_waypoint_ ){
-                        startNavigationGL(*current_waypoint_);
-                        while(!navigationFinished() && ros::ok()) sleep();
-                        has_activate_ = false;
-                    }
+
                     
                 }
             } catch(const SwitchRunningStatus &e) {
@@ -797,6 +902,8 @@ public:
 private:
     actionlib::SimpleActionClient<move_base_msgs::MoveBaseAction> move_base_action_;
     actionlib::SimpleActionClient<fulanghua_action::special_moveAction> action_client;
+    actionlib::SimpleActionClient<fulanghua_action::special_moveAction> rotate_client;
+    actionlib::SimpleActionClient<fulanghua_action::special_moveAction> battery_check_client;
     std::string amcl_filename_;
     // geometry_msgs::PoseArray waypoints_;
     orne_waypoints_msgs::WaypointArray waypoints_, charging_waypoints_ ;
@@ -806,8 +913,12 @@ private:
     std::vector<orne_waypoints_msgs::Pose>::iterator last_waypoint_;
     std::vector<orne_waypoints_msgs::Pose>::iterator first_waypoint_;
     std::vector<orne_waypoints_msgs::Pose>::iterator finish_pose_;
+    std_srvs::Empty::Request req;
+    std_srvs::Empty::Response res;
     bool has_activate_;
     std::string robot_frame_, world_frame_, cmd_vel_, CHARGE_TOPIC, robot_name_;
+    //MG400
+    const std::string ARUCO_DETECT_SERVICE_RESET = "/arucodetect/reset";
     tf::TransformListener tf_listener_;
     ros::Rate rate_;
     ros::ServiceServer start_server_, pause_server_, unpause_server_, stop_server_, suspend_server_, 
@@ -815,7 +926,10 @@ private:
     ros::Subscriber cmd_vel_sub_, charge_sub;
     ros::Publisher wp_pub_, cmd_vel_pub_, robot_coordinate_pub;
     ros::ServiceClient clear_costmaps_srv_, action_cmd_srv;
-    double last_moved_time_, dist_err_;
+    ros::ServiceClient charge_reset_srv;
+    double last_moved_time_, dist_err_,charge_threshold_lower_,charge_threshold_higher_;
+    double battery_=0.0;
+    int failed_counter=0;
     bool LOOP = false;
     bool REVERSE = false;
     bool action_finished = false;
@@ -823,6 +937,7 @@ private:
     bool CHARGING_STATION=false;
     bool _reached = false;
     bool p2p_flag =false;
+    bool _initial=true;
 };
 
 int main(int argc, char *argv[]){
